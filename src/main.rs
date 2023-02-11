@@ -3,10 +3,15 @@ use std::path::Path;
 
 type Subst = Vec<Result<String, String>>;
 
+enum Dest {
+    Var(String),
+    Stdout,
+}
+
 struct Command {
     func: Subst,
     args: Vec<Subst>,
-    dest: String,
+    dest: Dest,
 }
 
 fn parse(string: &str, actions: &mut Vec<Command>) {
@@ -23,7 +28,10 @@ fn parse(string: &str, actions: &mut Vec<Command>) {
         actions.push(Command {
             func: parse_subst(action),
             args: args.iter().map(|str| parse_subst(str)).collect(),
-            dest: variable.to_string(),
+            dest: match variable {
+                "%" => Dest::Stdout,
+                _ => Dest::Var(variable.to_string()),
+            },
         });
     }
 }
@@ -54,29 +62,31 @@ fn parse_subst(string: &str) -> Subst {
     return result;
 }
 
-const HEADER: &str = "#include <stdlib.h>
+const HEADER: &str = "#define _GNU_SOURCE
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <spawn.h>
-extern char**environ;\
-char*run(const char*restrict file,char*const argv[restrict]){\
-int status,len,procout[2];pid_t pid;posix_spawn_file_actions_t acts;char*result;\
-if((status=pipe(procout)))exit(status);\
-posix_spawn_file_actions_init(&acts);\
-posix_spawn_file_actions_adddup2(&acts,procout[1],STDOUT_FILENO);\
-if((status=posix_spawnp(&pid,file,&acts,NULL,argv,environ)))exit(status);\
-while(waitpid(pid,&status,0)==-1){}\
-posix_spawn_file_actions_destroy(&acts);\
-if((status=WEXITSTATUS(status)))exit(status);\
-result=malloc(len=lseek(procout[0],0,SEEK_END));\
-lseek(procout[0],0,SEEK_SET);\
-if(result==NULL)exit(1);\
-fread(result,1,len,fdopen(procout[0], \"r\"));\
-close(procout[0]);close(procout[1]);\
-return result;}\
+extern char**environ;
+char*run(const char*restrict file,char*const argv[restrict]){
+int status,len,output;pid_t pid;posix_spawn_file_actions_t acts;char*result;
+if((output=memfd_create(\"run_output\",0))==-1)exit(1);
+posix_spawn_file_actions_init(&acts);
+posix_spawn_file_actions_adddup2(&acts,output,STDOUT_FILENO);
+if((status=posix_spawnp(&pid,file,&acts,NULL,argv,environ)))exit(status);
+while(waitpid(pid,&status,0)==-1){}
+posix_spawn_file_actions_destroy(&acts);
+if((status=WEXITSTATUS(status)))exit(status);
+result=malloc(len=lseek(output,0,SEEK_END));
+lseek(output,0,SEEK_SET);
+if(result==NULL&&len!=0)exit(1);
+fread(result,1,len,fdopen(output, \"r\"));
+close(output);close(output);
+return result;}
 int main(void){";
 
 fn output(actions: Vec<Command>) -> String {
@@ -95,9 +105,12 @@ fn output(actions: Vec<Command>) -> String {
             "(char*)NULL",
             &mut result,
         );
-        result.push_str("char*");
-        result.push_str(&dest);
-        result.push_str("=run(func,args);}");
+        match dest {
+            Dest::Stdout => result.push_str("puts(run(func, args))"),
+            Dest::Var(var) => write!(&mut result, "char*{var}=run(func,args)").unwrap(),
+        }
+        result.push(';');
+        result.push('}');
     }
     result.push('}');
     result
@@ -160,9 +173,8 @@ fn conc(subst: &Subst, dest: &str, mut result: &mut String) {
     .unwrap();
     write!(
         &mut result,
-        "char*{dest}=malloc(length);if({dest}==NULL)exit(1);\
-        char*ref={dest};for(int i=0;i<{};)\
-        (memcpy(ref,substrings[i],lengths[i]),ref+=lengths[i++]);",
+        "char*{dest}=malloc(length);if({dest}==NULL&&length!=0)exit(1);\
+        char*ref={dest};for(int i=0;i<{};)(memcpy(ref,substrings[i],lengths[i]),ref+=lengths[i++]);",
         subst.len()
     )
     .unwrap();
